@@ -5,11 +5,6 @@ inputs:
   max-size:
     description: 'Maximum ccache cache size'
     required: false
-    # Bumped from 3G to 10G after LLVM 22.1: the wheel build now caches
-    # ~5,800 LLVM/MLIR compile entries on top of cudaq's ~700, which the
-    # 3G cap was too tight for (cache hit existing 3.5G of 5G headroom).
-    # 10G gives headroom across all toolchains (llvm + gcc12) without
-    # forcing eviction of useful entries.
     default: '10G'
   compression:
     description: 'Enable ccache compression'
