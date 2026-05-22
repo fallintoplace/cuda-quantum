@@ -18,8 +18,29 @@
 #include <iostream>
 #include <random>
 #include <set>
+#include <sstream>
 
 namespace {
+
+/// @brief Throw fast if the request cannot fit in free GPU memory, so
+/// optimizer retry loops don't pay the cost of letting cudaMalloc fail each
+/// time. If cudaMemGetInfo itself errors, fall through so the real CUDA
+/// failure isn't masked.
+void checkGpuMemoryOrThrow(std::size_t bytes, const char *what) {
+  std::size_t freeBytes = 0, totalBytes = 0;
+  if (cudaMemGetInfo(&freeBytes, &totalBytes) != cudaSuccess)
+    return;
+  // 5% headroom for custatevec scratch and kernel launch slop.
+  if (bytes > static_cast<std::size_t>(0.95 * freeBytes)) {
+    std::ostringstream msg;
+    msg << "[CuStateVecCircuitSimulator] " << what << " requires "
+        << (bytes >> 20) << " MiB but only " << (freeBytes >> 20)
+        << " MiB is free on this GPU (of " << (totalBytes >> 20)
+        << " MiB total). Switch to the nvidia-mgpu "
+        << "target across multiple GPUs, or reduce the qubit count.";
+    throw std::runtime_error(msg.str());
+  }
+}
 
 /// @brief The CuStateVecCircuitSimulator implements the CircuitSimulator
 /// base class to provide a simulator that delegates to the NVIDIA CuStateVec
@@ -177,6 +198,8 @@ protected:
     // the allocation is much easier
     if (!deviceStateVector) {
       // Create the memory and the handle
+      checkGpuMemoryOrThrow(stateDimension * sizeof(CudaDataType),
+                            "statevector allocation (addQubitsToState)");
       HANDLE_CUDA_ERROR(cudaMalloc((void **)&deviceStateVector,
                                    stateDimension * sizeof(CudaDataType)));
       HANDLE_ERROR(custatevecCreate(&handle));
@@ -214,6 +237,8 @@ protected:
 
     // Allocate new vector to place the kron prod result
     void *newDeviceStateVector;
+    checkGpuMemoryOrThrow(stateDimension * sizeof(CudaDataType),
+                          "expanded statevector for kron product");
     HANDLE_CUDA_ERROR(cudaMalloc((void **)&newDeviceStateVector,
                                  stateDimension * sizeof(CudaDataType)));
     HANDLE_CUDA_ERROR(cudaMemset(newDeviceStateVector, 0,
@@ -221,6 +246,8 @@ protected:
     // Place the state data on device. Could be that
     // we just need the zero state, or the user could have provided one
     void *otherState;
+    checkGpuMemoryOrThrow((1UL << count) * sizeof(CudaDataType),
+                          "input state buffer for kron product");
     HANDLE_CUDA_ERROR(cudaMalloc((void **)&otherState,
                                  (1UL << count) * sizeof(CudaDataType)));
     if (state == nullptr) {
@@ -266,6 +293,9 @@ protected:
 
     if (!deviceStateVector) {
       // Create the memory and the handle
+      checkGpuMemoryOrThrow(
+          stateDimension * sizeof(CudaDataType),
+          "statevector copy from input state (addQubitsToState)");
       HANDLE_CUDA_ERROR(cudaMalloc((void **)&deviceStateVector,
                                    stateDimension * sizeof(CudaDataType)));
       ownsDeviceVector = true;
@@ -282,6 +312,9 @@ protected:
     // Expanding the state
     // Allocate new vector to place the kron prod result
     void *newDeviceStateVector;
+    checkGpuMemoryOrThrow(
+        stateDimension * sizeof(CudaDataType),
+        "expanded statevector for kron product (input state)");
     HANDLE_CUDA_ERROR(cudaMalloc((void **)&newDeviceStateVector,
                                  stateDimension * sizeof(CudaDataType)));
     HANDLE_CUDA_ERROR(cudaMemset(newDeviceStateVector, 0,
@@ -310,6 +343,8 @@ protected:
     ScopedTraceWithContext("CuStateVecCircuitSimulator::addQubitToState");
     // Update the state vector
     if (!deviceStateVector) {
+      checkGpuMemoryOrThrow(stateDimension * sizeof(CudaDataType),
+                            "statevector allocation (addQubitToState)");
       HANDLE_CUDA_ERROR(cudaMalloc((void **)&deviceStateVector,
                                    stateDimension * sizeof(CudaDataType)));
       constexpr int32_t threads_per_block = 256;
@@ -321,6 +356,8 @@ protected:
     } else {
       // Allocate new state..
       void *newDeviceStateVector;
+      checkGpuMemoryOrThrow(stateDimension * sizeof(CudaDataType),
+                            "expanded statevector (addQubitToState)");
       HANDLE_CUDA_ERROR(cudaMalloc((void **)&newDeviceStateVector,
                                    stateDimension * sizeof(CudaDataType)));
       constexpr int32_t threads_per_block = 256;
