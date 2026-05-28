@@ -10,6 +10,7 @@
 #define CUDAQ_PYTHON_SIGNAL_CHECK_H
 
 #include "mlir/Support/LogicalResult.h"
+#include <functional>
 
 namespace mlir {
 class PassManager;
@@ -30,6 +31,9 @@ void addPythonSignalInstrumentation(mlir::PassManager &pm);
 /// (idempotent) when the GIL is already released by an outer caller.
 mlir::LogicalResult runPassManagerReleasingGIL(mlir::PassManager &pm,
                                                mlir::Operation *op);
+
+/// Run `fn` without holding the Python GIL.
+void withGilReleased(const std::function<void()> &fn);
 
 } // namespace cudaq
 

@@ -69,7 +69,8 @@ cudaq::CompileTarget::CompileTarget(
     pipelineConfig.overridePassPipeline = prepPipeline(
         backendConfig.TargetPassPipeline, "Pass pipeline (overridden)");
   } else {
-    pipelineConfig.runsStandardFinalize = true;
+    pipelineConfig.runsStandardFinalize =
+        pipelineConfig.hasConfiguredPassPipeline;
     pipelineConfig.highLevelPipeline =
         prepPipeline(backendConfig.JITHighLevelPipeline, "JIT high level");
     pipelineConfig.midLevelPipeline =

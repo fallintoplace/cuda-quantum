@@ -52,7 +52,8 @@ static void specializeKernel(const std::string &name, ModuleOp module,
   pm.addInstrumentation(std::make_unique<cudaq::TracePassInstrumentation>());
   cudaq_internal::compiler::ArgumentConverter argCon(name, module);
   // Look up the kernel's type signature.
-  argCon.gen(name, module, rawArgs);
+  argCon.gen(rawArgs);
+
   SmallVector<std::string> kernels;
   SmallVector<std::string> substs;
   for (auto *kInfo : argCon.getKernelSubstitutions()) {
@@ -107,8 +108,6 @@ static bool runTargetPassPipeline(mlir::ModuleOp module) {
   cudaq::CompileTarget ct(rt->config, rt->runtimeConfig,
                           cudaq::is_emulated_platform());
   const auto &pipelineConfig = ct.pipelineConfig;
-  if (!pipelineConfig.hasConfiguredPassPipeline)
-    return false;
   auto passPipeline = cudaq_internal::compiler::getPassPipeline(ct);
 
   auto *ctx = module.getContext();
@@ -197,25 +196,6 @@ std::string cudaq::detail::lower_to_openqasm(const std::string &name,
   return result;
 }
 
-/// Scan \p module and set flags in the current platform context accordingly.
-static void updateExecutionContext(mlir::ModuleOp module) {
-  auto *currentExecCtx = cudaq::getExecutionContext();
-  if (!currentExecCtx)
-    return;
-
-  for (auto &artifact : module) {
-    cudaq::quake::detail::QuakeFunctionAnalysis analysis{&artifact};
-    auto info = analysis.getAnalysisInfo();
-    if (info.empty())
-      continue;
-    auto result = info[&artifact];
-    if (result.hasConditionalsOnMeasure) {
-      currentExecCtx->hasConditionalsOnMeasureResults = true;
-      break;
-    }
-  }
-}
-
 static std::optional<cudaq::JitEngine>
 alreadyBuiltJITCode(const std::string &name) {
   auto *currentExecCtx = cudaq::getExecutionContext();
@@ -248,48 +228,79 @@ static void cacheJITForPerformance(cudaq::JitEngine jit) {
   }
 }
 
-/// When the execution context is "resource-count", extract gate counts and
-/// depth metrics from the optimized MLIR IR. Pre-counted gates are erased
-/// from the module, so the subsequent JIT compiles a near-empty module.
-static void precountResources(mlir::ModuleOp module) {
-  auto *ctx = cudaq::getExecutionContext();
-  if (!ctx || ctx->name != "resource-count")
-    return;
-  auto counts = cudaq::opt::countResourcesFromIR(module);
-  if (mlir::failed(counts))
-    return;
-  nvqir::resource_counter::prepopulate(std::move(*counts));
+std::unique_ptr<cudaq::CompileTarget>
+cudaq::ModuleLauncher::getCompileTarget() {
+  return getCompileTarget(cudaq::getExecutionContext());
 }
 
 namespace {
 struct PythonLauncher : public cudaq::ModuleLauncher {
+  class PythonLauncherCompileTarget : public cudaq::CompileTarget {
+    using cudaq::CompileTarget::CompileTarget;
+    void addPassInstrumentation(mlir::PassManager &pm) const override {
+      cudaq::addPythonSignalInstrumentation(pm);
+      pm.addInstrumentation(
+          std::make_unique<cudaq::TracePassInstrumentation>());
+    }
+    void withGilReleased(const std::function<void()> &fn) const override {
+      cudaq::withGilReleased(fn);
+    }
+  };
+
+  using cudaq::ModuleLauncher::getCompileTarget;
+  std::unique_ptr<cudaq::CompileTarget>
+  getCompileTarget(cudaq::ExecutionContext *context) override {
+    const bool enablePythonCodegenDump =
+        cudaq::getEnvBool("CUDAQ_PYTHON_CODEGEN_DUMP", false);
+    if (enablePythonCodegenDump) {
+      CUDAQ_WARN("CUDAQ_PYTHON_CODEGEN_DUMP is no longer supported and will be "
+                 "ignored. Use CUDAQ_MLIR_PRINT_EACH_PASS instead.");
+    }
+    std::unique_ptr<cudaq::CompileTarget> ct;
+    auto *rt = cudaq::get_platform().get_runtime_target();
+    if (!rt) {
+      ct = std::make_unique<PythonLauncherCompileTarget>();
+      ct->pipelineConfig.runsStandardFinalize = false;
+    } else {
+      ct = std::make_unique<PythonLauncherCompileTarget>(
+          rt->config, rt->runtimeConfig, cudaq::is_emulated_platform());
+    }
+
+    bool isLocalSimulator =
+        !(cudaq::is_remote_platform() || cudaq::is_emulated_platform());
+
+    ct->fullySpecialize = !isLocalSimulator;
+    ct->pipelineConfig.addDistributedDeviceCall = true;
+    ct->generateResourceCounts = context && context->name == "resource-count";
+    ct->argumentSynthChangeSemantics = false;
+    ct->pipelineConfig.codegenTranslation = "qir:";
+    ct->emitJit = true;
+    return ct;
+  }
+
   cudaq::CompiledModule compileModule(const cudaq::SourceModule &src,
                                       cudaq::KernelArgs args,
                                       bool isEntryPoint) override {
 
     ScopedTraceWithContext(cudaq::TIMING_LAUNCH,
                            "PythonLauncher::compileModule");
-    const auto &name = src.getName();
-    auto mlirArt = src.getMlir();
-    if (!mlirArt)
-      throw std::runtime_error(
-          "PythonLauncher::compileModule requires an MLIR artifact on the "
-          "SourceModule for kernel '" +
-          name + "'.");
-    ModuleOp module =
-        cudaq_internal::compiler::CompiledModuleHelper::getMlirModuleOp(
-            *mlirArt);
-    const bool enablePythonCodegenDump =
-        cudaq::getEnvBool("CUDAQ_PYTHON_CODEGEN_DUMP", false);
+    const auto &kernelName = src.getName();
+    auto modulePtr = src.getMlirOpaqueModulePtr();
+    assert(modulePtr &&
+           "PythonLauncher::compileModule requires an MLIR artifact");
 
-    std::string fullName = cudaq::runtime::cudaqGenPrefixName + name;
+    cudaq_internal::compiler::Compiler compiler(getCompileTarget());
+
+    ModuleOp module = ModuleOp::getFromOpaquePointer(modulePtr);
+
+    std::string fullName = cudaq::runtime::cudaqGenPrefixName + kernelName;
 
     auto funcOp = module.lookupSymbol<mlir::func::FuncOp>(fullName);
     if (!funcOp)
-      throw std::runtime_error("no kernel named " + name + " found in module");
+      throw std::runtime_error("no kernel named " + kernelName +
+                               " found in module");
     mlir::Type resultTy = cudaq::runtime::getReturnType(funcOp);
 
-    const bool hasResult = !!resultTy;
     auto resultInfo =
         cudaq_internal::compiler::CompiledModuleHelper::createResultInfo(
             resultTy, isEntryPoint, module);
@@ -298,81 +309,25 @@ struct PythonLauncher : public cudaq::ModuleLauncher {
     // checking if any non-callable arguments are present. This must be done
     // before the cache lookup so the cached path uses the correct value.
     bool isFullySpecialized = true;
-    FunctionType fromFuncTy = funcOp.getFunctionType();
-    // Specialization for direct calls will take care of partial specialization
-    // separately
-    bool isLocalSimulator =
-        !(cudaq::is_remote_platform() || cudaq::is_emulated_platform());
 
-    std::vector<void *> closureArgsVec;
-    std::span<void *const> closureArgs;
-    std::span<void *const> rawArgs =
-        args.hasTypeErased() ? *args.getTypeErased() : std::span<void *const>();
-
-    // Special handling in case the arguments were already synthesized
-    size_t numArgs = rawArgs.size() - (hasResult ? 1 : 0);
-    if (isEntryPoint && isLocalSimulator &&
-        numArgs == fromFuncTy.getNumInputs()) {
-      closureArgsVec = std::vector(rawArgs.begin(), rawArgs.end());
-      for (auto [i, ty] : llvm::enumerate(fromFuncTy.getInputs())) {
-        if (!isa<cudaq::cc::CallableType>(ty)) {
-          isFullySpecialized = false;
-          closureArgsVec[i] = nullptr;
-        }
+    { // JIT caching -- TODO: isFullySpecialized is WRONG here
+      if (auto jit = alreadyBuiltJITCode(kernelName)) {
+        auto jitArtifacts =
+            cudaq_internal::compiler::CompiledModuleHelper::createJitArtifacts(
+                kernelName, *jit, resultInfo, isFullySpecialized);
+        return cudaq_internal::compiler::CompiledModuleHelper::
+            createCompiledModule(kernelName, resultInfo, jitArtifacts);
       }
-      closureArgs = closureArgsVec;
-    } else {
-      // Avoid copying
-      closureArgs = rawArgs;
     }
 
-    if (auto jit = alreadyBuiltJITCode(name)) {
-      auto jitArtifacts =
-          cudaq_internal::compiler::CompiledModuleHelper::createJitArtifacts(
-              name, *jit, resultInfo, isFullySpecialized);
-      return cudaq_internal::compiler::CompiledModuleHelper::
-          createCompiledModule(name, resultInfo, jitArtifacts);
-    }
+    auto compiled =
+        compiler.runPassPipeline(kernelName, modulePtr, args, isEntryPoint);
+    auto jit = compiled.getJit().value();
 
-    // 1. Check that this call is sane.
-    if (enablePythonCodegenDump)
-      module.dump();
+    cacheJITForPerformance(jit.getEngine());
+    cudaq::compiler_artifact::saveArtifact(kernelName, jit.getEngine());
 
-    // 2. Merge other modules (e.g., if there are device kernel calls).
-    cudaq_internal::compiler::mergeAllCallableClosures(module, name, rawArgs);
-
-    // Mark all newly merged kernels private.
-    for (auto &op : module)
-      if (auto f = mlir::dyn_cast<mlir::func::FuncOp>(op))
-        if (f != funcOp)
-          f.setPrivate();
-
-    updateExecutionContext(module);
-
-    // 3. Specialize the kernel (argument synthesis, optimization).
-    CUDAQ_INFO("Run Argument Synth.\n");
-    if (enablePythonCodegenDump)
-      module.dump();
-
-    specializeKernel(name, module, closureArgs, resultTy,
-                     enablePythonCodegenDump, isEntryPoint, isFullySpecialized);
-
-    // 3b. Run target-specific passes if configured.
-    runTargetPassPipeline(module);
-
-    // 3c. Pre-count resources from the optimized IR when resource-counting.
-    precountResources(module);
-
-    // 4. Lower to QIR and JIT compile.
-    auto jit = cudaq_internal::compiler::createJITEngine(module, "qir:");
-    cacheJITForPerformance(jit);
-    cudaq::compiler_artifact::saveArtifact(name, jit);
-
-    auto jitArtifacts =
-        cudaq_internal::compiler::CompiledModuleHelper::createJitArtifacts(
-            name, jit, resultInfo, isFullySpecialized);
-    return cudaq_internal::compiler::CompiledModuleHelper::createCompiledModule(
-        name, std::move(resultInfo), jitArtifacts);
+    return compiled;
   }
 };
 } // namespace

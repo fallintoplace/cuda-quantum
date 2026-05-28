@@ -72,27 +72,16 @@ protected:
   /// @brief The target configuration
   cudaq::config::TargetConfig targetConfig;
 
-  const void *compileModulePreamble(const SourceModule &src) const {
-    const auto &kernelName = src.getName();
-    auto mlirArt = src.getMlir();
-    if (!mlirArt)
-      throw std::runtime_error(
-          "compileModulePreamble requires an MLIR artifact on "
-          "the SourceModule for kernel '" +
-          kernelName + "'.");
-    auto modulePtr = mlirArt->getOpaqueModulePtr();
-    return modulePtr;
-  }
-
   template <typename Policy>
   CompiledModule compileModuleImpl(Policy &policy, const SourceModule &src,
                                    KernelArgs args, bool isEntryPoint) {
     const auto &kernelName = src.getName();
-    auto modulePtr = compileModulePreamble(src);
+    auto modulePtr = src.getMlirOpaqueModulePtr();
     CUDAQ_INFO("specializing remote rest kernel via module ({}) with {} policy",
                kernelName, policy.name);
     Compiler compiler(getCompileTarget(policy));
-    auto compiled = compiler.runPassPipeline(kernelName, modulePtr, args);
+    auto compiled =
+        compiler.runPassPipeline(kernelName, modulePtr, args, isEntryPoint);
     if constexpr (std::is_same_v<Policy, sample_policy>) {
       if (compiler.hasWarnedNamedMeasurements())
         policy.warnedNamedMeasurements = true;
@@ -293,12 +282,11 @@ public:
   CompiledModule compileModule(const SourceModule &src, KernelArgs args,
                                bool isEntryPoint) override {
     const auto &kernelName = src.getName();
-    auto modulePtr = compileModulePreamble(src);
+    auto modulePtr = src.getMlirOpaqueModulePtr();
     CUDAQ_INFO("specializing remote rest kernel via module ({})", kernelName);
 
     Compiler compiler(getCompileTarget(getExecutionContext()));
-    auto compiled = compiler.runPassPipeline(kernelName, modulePtr, args);
-    return compiled;
+    return compiler.runPassPipeline(kernelName, modulePtr, args, isEntryPoint);
   }
 
   CompiledModule compileModule(sample_policy &policy, const SourceModule &src,
@@ -315,8 +303,8 @@ public:
   compileKernelExecutions(Policy &policy, const AnyModule &module,
                           KernelArgs args) {
     Compiler compiler(getCompileTarget(policy));
-    std::vector<cudaq::KernelExecution> codes;
     std::string kernelName;
+    std::optional<CompiledModule> compiled;
     if (std::holds_alternative<SourceModule>(module)) {
       const auto &src = std::get<SourceModule>(module);
       kernelName = src.getName();
@@ -324,17 +312,24 @@ public:
 
       auto [moduleOp, context] = Compiler::loadQuakeCodeByName(kernelName);
 
-      codes = compiler.lowerQuakeCode(kernelName, moduleOp, args);
+      compiled = compiler.runPassPipeline(kernelName, moduleOp, args, true);
       if constexpr (std::is_same_v<Policy, sample_policy>) {
         if (compiler.hasWarnedNamedMeasurements())
           policy.warnedNamedMeasurements = true;
       }
     } else {
-      const auto &compiled = std::get<CompiledModule>(module);
-      kernelName = compiled.getName();
+      compiled = std::get<CompiledModule>(module);
+      kernelName = compiled->getName();
       CUDAQ_INFO("launching remote rest kernel via module ({})", kernelName);
-      codes = compiler.emitKernelExecutions(compiled);
     }
+
+    // Propagate metadata from the compiled artifact to the execution context.
+    if (auto ctx = getExecutionContext()) {
+      ctx->hasConditionalsOnMeasureResults =
+          compiled->getMetadata().hasConditionalsOnMeasureResults;
+    }
+
+    auto codes = compiler.emitKernelExecutions(*compiled);
 
     return {kernelName, codes};
   }

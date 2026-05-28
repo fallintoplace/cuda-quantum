@@ -13,6 +13,10 @@
 #include <optional>
 #include <string>
 
+namespace mlir {
+class PassManager;
+} // namespace mlir
+
 namespace cudaq {
 
 /// Target properties used to define the compilation pipeline.
@@ -20,6 +24,13 @@ class CompileTarget {
 public:
   /// Hook to update the pass pipeline before compilation.
   virtual void updatePassPipeline(std::string &passPipeline) const {}
+
+  /// Hook to add pass instrumentation to the pass manager.
+  virtual void addPassInstrumentation(mlir::PassManager &pm) const {}
+
+  /// Hook to run long-running operations, for which it might make sense to
+  /// release the GIL.
+  virtual void withGilReleased(const std::function<void()> &fn) const { fn(); }
 
   /// Resolved MLIR pass-pipeline and `codegen` settings.
   struct PipelineConfig {
@@ -46,6 +57,9 @@ public:
 
     /// Whether to run the add-measurements pass.
     bool addMeasurements = false;
+
+    /// Whether to run the distributed-device-call pass.
+    bool addDistributedDeviceCall = false;
   };
 
   /// Pipeline configuration, populated by the constructor.
@@ -70,6 +84,15 @@ public:
   /// and simplify the IR to remove all quantum operations already accounted
   /// for in the counts.
   bool generateResourceCounts = false;
+
+  /// Whether to fully specialize the kernel.
+  bool fullySpecialize = true;
+
+  /// Set the `changeSemantics` flag for the argument synthesis pass.
+  bool argumentSynthChangeSemantics = true;
+
+  /// Whether to emit JITed code.
+  bool emitJit = false;
 
   /// When set, emit one lowered module per non-identity Pauli term of this
   /// observable. The resulting `CompiledModule` will contain a compilation

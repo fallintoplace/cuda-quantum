@@ -70,10 +70,11 @@ class Compiler {
   void applyPipeline(const std::string &pipeline, mlir::ModuleOp moduleOp,
                      const std::string &kernelName);
 
+public: // TODO: revert
   /// Build the module, merge closures, and synthesize arguments.
-  std::pair<mlir::ModuleOp, mlir::func::FuncOp>
+  std::tuple<mlir::ModuleOp, mlir::func::FuncOp, bool>
   prepareModule(const std::string &kernelName, mlir::ModuleOp m_module,
-                cudaq::KernelArgs args);
+                cudaq::KernelArgs args, bool isEntryPoint);
 
   /// Delay combine-measurements for emulation, then run the main pass
   /// pipeline.  Returns
@@ -86,7 +87,8 @@ class Compiler {
   cudaq::CompiledModule assembleCompiledModule(
       const std::string &kernelName,
       std::vector<std::pair<std::string, mlir::ModuleOp>> &modules,
-      bool needJit, bool runCombineMeasurements,
+      bool needJit, bool isFullySpecialized, bool isEntryPoint,
+      bool runCombineMeasurements,
       std::optional<cudaq::Resources> resourceCounts,
       cudaq::CompiledModule::CompilationMetadata metadata,
       std::shared_ptr<mlir::MLIRContext> context);
@@ -113,7 +115,7 @@ public:
   /// context lifetime must be managed by the caller.
   cudaq::CompiledModule
   runPassPipeline(const std::string &kernelName, const void *modulePtr,
-                  cudaq::KernelArgs args,
+                  cudaq::KernelArgs args, bool isEntryPoint,
                   std::shared_ptr<mlir::MLIRContext> context = nullptr);
 
   /// @brief Emit target-specific code for each `MlirArtifact` in the
@@ -132,7 +134,7 @@ public:
   /// this call in any way necessary without breaking some other kernel launch.
   std::vector<cudaq::KernelExecution>
   lowerQuakeCode(const std::string &kernelName, const void *modulePtr,
-                 cudaq::KernelArgs args);
+                 cudaq::KernelArgs args, bool isEntryPoint);
 };
 
 /// Get the pass pipeline string for the given compile target.

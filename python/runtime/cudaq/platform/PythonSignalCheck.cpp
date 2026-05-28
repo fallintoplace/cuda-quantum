@@ -51,19 +51,15 @@ void cudaq::addPythonSignalInstrumentation(PassManager &pm) {
 
 LogicalResult cudaq::runPassManagerReleasingGIL(PassManager &pm,
                                                 Operation *op) {
-  auto *ctx = pm.getContext();
-  auto enablePrintEachPass =
-      cudaq::getEnvBool("CUDAQ_MLIR_PRINT_EACH_PASS", false);
-  auto disableThreading =
-      cudaq::getEnvBool("CUDAQ_MLIR_DISABLE_THREADING", false);
-  if (enablePrintEachPass || disableThreading)
-    ctx->disableMultithreading();
-  if (enablePrintEachPass)
-    pm.enableIRPrinting();
-  if (!PyGILState_Check())
-    return pm.run(op);
-  PyThreadState *save = PyEval_SaveThread();
-  auto result = pm.run(op);
-  PyEval_RestoreThread(save);
+  LogicalResult result = LogicalResult::success();
+  withGilReleased([&]() { result = pm.run(op); });
   return result;
+}
+
+void cudaq::withGilReleased(const std::function<void()> &fn) {
+  if (!PyGILState_Check())
+    return fn();
+  PyThreadState *save = PyEval_SaveThread();
+  fn();
+  PyEval_RestoreThread(save);
 }

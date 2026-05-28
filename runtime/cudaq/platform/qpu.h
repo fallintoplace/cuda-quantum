@@ -182,6 +182,10 @@ struct ModuleLauncher : public registry::RegisteredType<ModuleLauncher> {
   /// CompiledModule.
   virtual CompiledModule compileModule(const SourceModule &src, KernelArgs args,
                                        bool isEntryPoint) = 0;
+
+  virtual std::unique_ptr<CompileTarget>
+  getCompileTarget(ExecutionContext *context) = 0;
+  virtual std::unique_ptr<CompileTarget> getCompileTarget();
 };
 
 } // namespace cudaq
